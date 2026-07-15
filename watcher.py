@@ -17,6 +17,10 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+# .env 파일이 있다면 로드 (로컬 테스트용)
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -328,18 +332,60 @@ def is_dry_run() -> bool:
     return os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
 
 
+def send_telegram_message(text: str) -> bool:
+    """텔레그램 API를 호출하여 메시지를 발송한다."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        logger.error("텔레그램 환경변수(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)가 설정되지 않았습니다.")
+        return False
+        
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    
+    for attempt in range(1, 3):  # 최대 2회 재시도
+        try:
+            response = requests.post(url, json=payload, timeout=10)
+            response.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.warning("텔레그램 메시지 발송 실패 (attempt %d/2): %s", attempt, e)
+            if attempt < 2:
+                time.sleep(2)
+                
+    logger.error("텔레그램 메시지 발송을 최종 실패했습니다.")
+    return False
+
+
 def send_telegram_alert(movie_title: str, target_date: str) -> bool:
     """예매 오픈 알림을 텔레그램으로 발송한다."""
-    # TODO: Phase 3에서 구현
-    logger.info("[TODO] 텔레그램 알림 발송: %s (%s)", movie_title, target_date)
-    return True
+    formatted_date = f"{target_date[:4]}.{target_date[4:6]}.{target_date[6:]}"
+    detected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    
+    text = (
+        f"🔔 *용아맥 예매 오픈!* 🔔\n\n"
+        f"🎬 영화: {movie_title}\n"
+        f"📅 상영일: {formatted_date}\n"
+        f"🕐 감지 시각: {detected_at}\n\n"
+        f"👉 지금 바로 예매하세요!\n"
+        f"https://m.cgv.co.kr/WebApp/MovieV4/movieDetail.aspx?theaterCd=0013&date={target_date}"
+    )
+    
+    logger.info("텔레그램 알림 발송 시도: %s (%s)", movie_title, target_date)
+    return send_telegram_message(text)
 
 
 def send_telegram_warning(message: str) -> bool:
     """시스템 경고 알림을 텔레그램으로 발송한다."""
-    # TODO: Phase 3에서 구현
-    logger.info("[TODO] 텔레그램 경고 발송: %s", message)
-    return True
+    text = f"⚠️ *Yong-IMAX Watcher 시스템 경고* ⚠️\n\n{message}"
+    logger.info("텔레그램 경고 발송 시도: %s", message)
+    return send_telegram_message(text)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +421,8 @@ def main():
 
     if not current_results:
         logger.warning("크롤링 결과가 없습니다. 이전 상태를 유지합니다.")
-        # TODO: Phase 3 — 전체 실패 시 경고 알림
+        if not is_dry_run():
+            send_telegram_warning("전체 날짜 크롤링에 실패했습니다. 사이트 구조 변경 등을 확인하세요.")
         return
 
     # 4. 상태 비교 및 알림 대상 추출
