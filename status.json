@@ -1,7 +1,12 @@
 {
-  "last_checked": "2026-07-15T21:07:57.922286+09:00",
+  "last_checked": "2026-07-15T21:24:10.693078+09:00",
   "dates": {
     "20260715": {
+      "imax_opened": false,
+      "movie_title": "",
+      "first_detected_at": null
+    },
+    "20260731": {
       "imax_opened": false,
       "movie_title": "",
       "first_detected_at": null
