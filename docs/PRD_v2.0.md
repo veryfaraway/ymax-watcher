@@ -8,7 +8,7 @@
 
 ## 2. 주요 변경 사항
 ### F-1. 다중 극장 & 다중 특수관 지원 (Multi-Targets)
-* `config.json`의 `targets` 배열을 순회하며 크롤링.
+* `config.json`의 `monitors` 배열을 통해 상영관(특수관)별로 독립적인 감시 날짜(`target_dates`)를 설정하여 크롤링 최적화.
 * 지원 hall_type: `IMAX`, `4DX`, `SCREENX`, `DOLBY` 등 텍스트 매칭 기반.
 
 ### F-2. 잔여 좌석(취켓팅) 모니터링

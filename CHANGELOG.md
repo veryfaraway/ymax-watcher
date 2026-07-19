@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - 크롤링/파싱 이상 감지 시 텔레그램으로 경고(Warning) 알림을 발송하는 Health Check 시스템 도입.
 - GitHub Actions 워크플로우에 Playwright 브라우저 설치 및 캐싱(Cache) 단계 추가.
 - `config.json`에 `area` (지역) 설정 추가.
+- `config.json`에 `monitors` 배열을 도입하여 SCREENX, 4DX 등 다양한 특수관을 지원하고, 상영관별로 독립적인 감시 날짜 설정 기능 추가.
 
 ### Changed
 - **[CRITICAL]** CGV Next.js SPA 리뉴얼 및 내부 API 인증 강화에 대응하여 크롤링 엔진을 `requests` + `BeautifulSoup`에서 **Playwright 헤드리스 브라우저** 기반으로 전면 교체.
