@@ -83,12 +83,17 @@ def load_config() -> dict:
     if "theater_code" not in config:
         logger.error("config.json에 'theater_code' 필드가 없습니다.")
         sys.exit(1)
-    if "target_dates" not in config or not isinstance(config["target_dates"], list):
-        logger.error("config.json에 'target_dates' 리스트가 없습니다.")
-        sys.exit(1)
         
-    if "hall_types" not in config:
-        config["hall_types"] = ["IMAX"]  # 호환성을 위한 기본값
+    # 하위 호환성: monitors가 없으면 기존 target_dates를 monitors 포맷으로 변환
+    if "monitors" not in config:
+        if "target_dates" in config and isinstance(config["target_dates"], list):
+            hall_types = config.get("hall_types", ["IMAX"])
+            config["monitors"] = [
+                {"hall_type": ht, "target_dates": config["target_dates"]} for ht in hall_types
+            ]
+        else:
+            logger.error("config.json에 'monitors' 또는 'target_dates' 설정이 없습니다.")
+            sys.exit(1)
 
     return config
 
@@ -259,7 +264,9 @@ def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
 
     theater_name = config.get("theater_name", "용산아이파크몰").replace("CGV ", "")
     area = config.get("area", "서울")
-    target_dates = config["target_dates"]
+    monitors = config.get("monitors", [])
+    unique_dates = sorted(list(set(d for m in monitors for d in m.get("target_dates", []))))
+    
     results = {}
     health_issues = []
 
@@ -330,10 +337,14 @@ def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
             if screen_info.count() == 0:
                 health_issues.append("상영 정보(screenInfo)가 렌더링되지 않았습니다")
 
-            # ── Step 4: 각 날짜별 IMAX 확인 ──
-            for i, date_str in enumerate(target_dates):
+            # ── Step 4: 각 날짜별 설정된 특수관 확인 ──
+            for i, date_str in enumerate(unique_dates):
                 if len(date_str) != 8 or not date_str.isdigit():
                     logger.warning("잘못된 날짜 형식 스킵: %s", date_str)
+                    continue
+
+                types_for_date = list(set(m["hall_type"] for m in monitors if date_str in m.get("target_dates", [])))
+                if not types_for_date:
                     continue
 
                 try:
@@ -343,7 +354,7 @@ def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
 
                     page.wait_for_timeout(PW_SCHEDULE_WAIT)
 
-                    opened_movies = _parse_schedule(page, config["hall_types"])
+                    opened_movies = _parse_schedule(page, types_for_date)
                     results[date_str] = {
                         "opened_movies": opened_movies
                     }
@@ -352,7 +363,7 @@ def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
                         for m in opened_movies:
                             logger.info("[%s] %s 오픈: %s", date_str, m['type'], m['title'])
                     else:
-                        logger.info("[%s] %s 미오픈", date_str, "/".join(config["hall_types"]))
+                        logger.info("[%s] %s 미오픈", date_str, "/".join(types_for_date))
 
                 except PwTimeout:
                     logger.error("[%s] 타임아웃 발생", date_str)
@@ -362,7 +373,7 @@ def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
                     health_issues.append(f"[{date_str}] 파싱 오류: {e}")
 
                 # Anti-ban 딜레이
-                if i < len(target_dates) - 1:
+                if i < len(unique_dates) - 1:
                     delay = random.uniform(*REQUEST_DELAY_RANGE)
                     time.sleep(delay)
 
@@ -533,17 +544,18 @@ def main():
 
     # 1. 설정 로드
     config = load_config()
-    target_dates = config["target_dates"]
+    monitors = config.get("monitors", [])
+    unique_dates = sorted(list(set(d for m in monitors for d in m.get("target_dates", []))))
 
-    if not target_dates:
+    if not unique_dates:
         logger.warning("감시 대상 날짜가 없습니다. config.json의 target_dates를 설정하세요.")
         return
 
     logger.info(
-        "극장: %s (%s), 감시 날짜: %s",
+        "극장: %s (%s), 감시 대상: %s",
         config.get("theater_name", ""),
         config["theater_code"],
-        ", ".join(target_dates),
+        ", ".join(f"{m['hall_type']}({len(m.get('target_dates', []))}일)" for m in monitors),
     )
 
     # 2. 이전 상태 로드

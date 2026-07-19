@@ -2,6 +2,14 @@
   "theater_code": "0013",
   "theater_name": "CGV 용산아이파크몰",
   "area": "서울",
-  "target_dates": ["20260731"],
-  "hall_types": ["SCREENX"]
+  "monitors": [
+    {
+      "hall_type": "SCREENX",
+      "target_dates": ["20260729"]
+    },
+    {
+      "hall_type": "IMAX",
+      "target_dates": ["20260805"]
+    }
+  ]
 }
