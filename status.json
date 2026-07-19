@@ -1,11 +1,27 @@
 {
-  "last_checked": "2026-07-19T23:05:47.529990+09:00",
+  "last_checked": "2026-07-19T23:26:59.486050+09:00",
   "dates": {
     "20260731": {
       "opened_movies": [
         {
           "title": "스파이더맨-브랜드 뉴 데이",
           "type": "SCREENX"
+        }
+      ]
+    },
+    "20260729": {
+      "opened_movies": [
+        {
+          "title": "스파이더맨-브랜드 뉴 데이",
+          "type": "SCREENX"
+        }
+      ]
+    },
+    "20260805": {
+      "opened_movies": [
+        {
+          "title": "오디세이",
+          "type": "IMAX"
         }
       ]
     }
