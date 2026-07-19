@@ -1,9 +1,14 @@
 """
 Yong-IMAX Watcher — CGV 용산 IMAX 예매 오픈 감시 스크립트
 
-Phase 1: 크롤링 엔진
-Phase 2: 상태 관리 (TODO)
-Phase 3: 텔레그램 알림 (TODO)
+v2.0: Playwright 기반 크롤링 엔진 (CGV Next.js SPA 대응)
+  - CGV가 Next.js SPA로 리뉴얼되면서 기존 requests+BeautifulSoup 파싱 불가
+  - Playwright 헤드리스 브라우저로 예매 페이지 직접 탐색
+  - 건강 체크(Health Check) 시스템으로 파싱 이상 감지 시 경고 알림
+
+Phase 1: 크롤링 엔진 (Playwright)
+Phase 2: 상태 관리
+Phase 3: 텔레그램 알림 + 경고 알림
 """
 
 import json
@@ -16,7 +21,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # .env 파일이 있다면 로드 (로컬 테스트용)
@@ -30,20 +34,20 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 STATUS_PATH = BASE_DIR / "status.json"
 
-CGV_SHOWTIMES_URL = (
-    "http://www.cgv.co.kr/common/showtimes/iframeTheater.aspx"
-)
-
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-HTTP_TIMEOUT = 15  # seconds
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
-REQUEST_DELAY_RANGE = (1.0, 2.0)  # seconds between requests
+# Playwright 설정
+PW_TIMEOUT = 30000        # 30초
+PW_NAV_WAIT = 5000        # 네비게이션 후 대기
+PW_CLICK_WAIT = 2000      # 클릭 후 대기
+PW_SCHEDULE_WAIT = 3000   # 상영시간표 로딩 대기
+
+# 요청 간 딜레이 (Anti-ban)
+REQUEST_DELAY_RANGE = (2.0, 5.0)
 
 KST = timezone(timedelta(hours=9))
 
@@ -59,7 +63,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Phase 1: Configuration
+# Configuration
 # ---------------------------------------------------------------------------
 
 
@@ -87,180 +91,295 @@ def load_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Crawling Engine
+# Phase 1: Playwright 크롤링 엔진
 # ---------------------------------------------------------------------------
 
 
-def fetch_showtimes(theater_code: str, date: str) -> str | None:
+def _close_popup(page) -> None:
+    """CGV 메인 페이지 팝업 모달을 닫는다."""
+    for selector in [".mmns00008_close__BeES6", "button:has-text('닫기')", "button:has-text('오늘은 그만 보기')"]:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=1500):
+                btn.click(force=True)
+                page.wait_for_timeout(500)
+                logger.debug("팝업 닫기: %s", selector)
+                return
+        except Exception:
+            continue
+
+
+def _click_date_button(page, target_date: str) -> bool:
     """
-    CGV 상영시간표 iframe 페이지를 요청하여 HTML을 반환한다.
+    날짜 스크롤 바에서 목표 날짜 버튼을 클릭한다.
+
+    CGV 날짜 버튼 형식:
+      - 같은 달: "오늘19", "월20", ..., "금31"
+      - 다음 달: "토8.1", "일02"
 
     Args:
-        theater_code: CGV 극장 코드 (e.g., "0013")
-        date: 조회 날짜 (YYYYMMDD 형식)
-
+        target_date: YYYYMMDD 형식
     Returns:
-        HTML 문자열 또는 실패 시 None
+        클릭 성공 여부
     """
-    params = {"theatercode": theater_code, "date": date}
-    headers = {"User-Agent": USER_AGENT}
+    target_day = int(target_date[6:8])
+    target_month = int(target_date[4:6])
+    today = datetime.now(KST)
+    is_same_month = target_month == today.month
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.get(
-                CGV_SHOWTIMES_URL,
-                params=params,
-                headers=headers,
-                timeout=HTTP_TIMEOUT,
-            )
-            response.raise_for_status()
-            logger.info(
-                "[%s] 크롤링 성공 (attempt %d, %d bytes)",
-                date, attempt, len(response.text),
-            )
-            return response.text
+    # 날짜 버튼 목록을 가져온다
+    day_buttons = page.locator("[class*='dayScroll_scrollItem']")
+    count = day_buttons.count()
 
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code if e.response is not None else "N/A"
-            logger.warning(
-                "[%s] HTTP 오류 %s (attempt %d/%d)",
-                date, status_code, attempt, MAX_RETRIES,
-            )
-        except requests.exceptions.ConnectionError:
-            logger.warning(
-                "[%s] 연결 실패 (attempt %d/%d)",
-                date, attempt, MAX_RETRIES,
-            )
-        except requests.exceptions.Timeout:
-            logger.warning(
-                "[%s] 요청 타임아웃 (attempt %d/%d)",
-                date, attempt, MAX_RETRIES,
-            )
-        except requests.exceptions.RequestException as e:
-            logger.warning(
-                "[%s] 요청 오류: %s (attempt %d/%d)",
-                date, e, attempt, MAX_RETRIES,
-            )
+    if count == 0:
+        logger.warning("날짜 스크롤바를 찾을 수 없습니다")
+        return False
 
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY)
+    for i in range(count):
+        btn = day_buttons.nth(i)
+        text = btn.text_content().strip()
 
-    logger.error("[%s] %d회 시도 모두 실패. 스킵합니다.", date, MAX_RETRIES)
-    return None
-
-
-def parse_imax_status(html: str) -> tuple[bool, str]:
-    """
-    상영시간표 HTML에서 IMAX 상영 여부와 영화 제목을 파싱한다.
-
-    CGV iframe 페이지 구조:
-      div.sect-showtimes > ul > li  (영화별 컨테이너)
-        div.info-movie > a > strong  (영화 제목)
-        div.type-hall > div.info-hall > ul > li > a > span.imax  (IMAX 표기)
-
-    Returns:
-        (imax_opened, movie_title) 튜플.
-        IMAX 상영이 없으면 (False, ""), 있으면 (True, "영화제목").
-        복수 IMAX 영화가 있으면 첫 번째 영화를 반환한다.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 영화별 컨테이너를 순회
-    movie_items = soup.select("div.sect-showtimes > ul > li")
-
-    for item in movie_items:
-        # 해당 영화 블록 내에서 IMAX 상영관 존재 여부 확인
-        imax_spans = item.select("span.imax")
-        if not imax_spans:
-            # "IMAX" 텍스트를 포함하는 span도 탐색 (클래스가 다를 수 있음)
-            hall_names = item.select("div.info-hall span")
-            imax_found = any("IMAX" in span.get_text() for span in hall_names)
-            if not imax_found:
-                continue
-
-        # 영화 제목 추출
-        title_tag = item.select_one("div.info-movie a strong")
-        if title_tag:
-            movie_title = title_tag.get_text(strip=True)
+        # 같은 달: "금31" → 끝의 숫자가 target_day와 일치
+        # 다음 달: "8.1" → "M.D" 형식에서 M=target_month, D=target_day
+        if is_same_month:
+            # 텍스트에서 숫자 추출 (마지막 숫자들)
+            import re
+            match = re.search(r'(\d+)$', text)
+            if match and int(match.group(1)) == target_day:
+                btn.scroll_into_view_if_needed()
+                btn.click()
+                logger.info("[%s] 날짜 선택: '%s'", target_date, text)
+                return True
         else:
-            # fallback: info-movie 내 텍스트
-            info_movie = item.select_one("div.info-movie")
-            movie_title = info_movie.get_text(strip=True) if info_movie else "제목 미상"
+            # "8.1" 형식
+            target_str = f"{target_month}.{target_day}"
+            # 또는 "02" (2자리 일)
+            target_str2 = f"{target_day:02d}"
+            if target_str in text or (not is_same_month and text.endswith(target_str2)):
+                btn.scroll_into_view_if_needed()
+                btn.click()
+                logger.info("[%s] 날짜 선택: '%s'", target_date, text)
+                return True
 
-        logger.info("IMAX 상영 감지: %s", movie_title)
-        return True, movie_title
+    logger.warning("[%s] 날짜 버튼을 찾지 못함 (버튼 %d개 검색)", target_date, count)
+    return False
 
-    # IMAX 컨테이너를 못 찾은 경우 전체 HTML에서 한 번 더 확인
-    if soup.find("span", class_="imax") or soup.find("span", string=lambda t: t and "IMAX" in t):
-        logger.info("IMAX 태그 발견 (구조 불일치, 제목 미파싱)")
-        return True, "제목 미상"
 
+def _parse_schedule(page) -> tuple[bool, str]:
+    """
+    현재 렌더링된 예매 페이지에서 IMAX 상영 여부를 파싱한다.
+    DOM을 순회하며 영화 제목(title2 등)과 상영 타입(IMAX)의 연관성을 찾는다.
+
+    Returns:
+        (imax_found, movie_title) 튜플
+    """
+    try:
+        # 브라우저 컨텍스트 내에서 실행되는 DOM 분석 스크립트
+        imax_movies = page.evaluate('''() => {
+            const results = [];
+            
+            // 전략 1: 영화 카드로 추정되는 블록(li, item, movie)에서 IMAX 뱃지/텍스트와 제목을 함께 추출
+            const movieCards = document.querySelectorAll('li, [class*="item"], [class*="movie"], [class*="card"], [class*="sect-showtimes"]');
+            
+            for (const card of movieCards) {
+                const titleEl = card.querySelector('[class*="title2"], [class*="movNm"], [class*="movie-name"], strong');
+                const title = titleEl ? titleEl.textContent.trim() : "";
+                
+                const hasImaxImg = card.querySelector('img[alt*="IMAX"]') !== null;
+                const hasImaxText = card.textContent.toUpperCase().includes('IMAX');
+                
+                if (title && title.length > 1 && (hasImaxImg || hasImaxText)) {
+                    if (!results.includes(title)) {
+                        results.push(title);
+                    }
+                }
+            }
+            
+            // 전략 2: 형제/이웃 요소 기반 탐색 (클래스 구조가 평탄화된 경우)
+            if (results.length === 0) {
+                const allTitles = document.querySelectorAll('[class*="screenInfo_title"]');
+                for (let i = 0; i < allTitles.length; i++) {
+                    const text = allTitles[i].textContent.trim();
+                    if (text.toUpperCase().includes('IMAX')) {
+                        // IMAX 텍스트를 찾았으면 앞선 요소들 중 진짜 영화 제목을 찾음 (상영 타입 제외)
+                        for (let j = i - 1; j >= 0; j--) {
+                            const prevText = allTitles[j].textContent.trim();
+                            const isScreenType = prevText.includes('2D') || prevText.includes('4DX') || 
+                                                 prevText.includes('SCREENX') || prevText.includes('관');
+                            
+                            if (prevText && !isScreenType && prevText.length > 1) {
+                                if (!results.includes(prevText)) {
+                                    results.push(prevText);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return results;
+        }''')
+        
+        if imax_movies:
+            # 여러 개일 경우 콤마로 연결해서 확인, 반환은 첫번째 영화
+            logger.info("IMAX 감지: %s", ", ".join(imax_movies))
+            return True, imax_movies[0]
+            
+        # 최후의 수단: 단순히 화면 전체에 IMAX가 있는지 검사
+        content = page.content()
+        if "IMAX" in content:
+            logger.info("IMAX 텍스트는 감지되었으나 영화 제목을 매칭하지 못함")
+            return True, "제목 미상 (IMAX 발견)"
+            
+    except Exception as e:
+        logger.error("IMAX 파싱 스크립트 실행 중 오류: %s", e)
+        
     return False, ""
 
 
-def crawl_target_dates(config: dict) -> dict:
+def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
     """
-    config의 target_dates를 순회하며 각 날짜의 IMAX 상영 상태를 크롤링한다.
+    Playwright로 CGV 예매 페이지에 접근하여 각 날짜의 IMAX 상영 상태를 확인한다.
 
     Args:
         config: load_config()로 읽은 설정 딕셔너리
 
     Returns:
-        {
-            "20260722": {"imax_opened": False, "movie_title": ""},
-            "20260723": {"imax_opened": True, "movie_title": "인셉션 재개봉"},
-        }
+        (results, health_issues) 튜플
+        results: {"20260731": {"imax_opened": True, "movie_title": "스파이더맨"}, ...}
+        health_issues: 건강 체크 이상 목록
     """
-    theater_code = config["theater_code"]
+    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
+    theater_name = config.get("theater_name", "용산아이파크몰").replace("CGV ", "")
+    area = config.get("area", "서울")
     target_dates = config["target_dates"]
     results = {}
-    fetch_failures = 0
+    health_issues = []
 
-    for i, date in enumerate(target_dates):
-        # 날짜 형식 검증
-        if len(date) != 8 or not date.isdigit():
-            logger.warning("잘못된 날짜 형식 스킵: %s (YYYYMMDD 필요)", date)
-            continue
-
-        html = fetch_showtimes(theater_code, date)
-
-        if html is None:
-            fetch_failures += 1
-            # 크롤링 실패 시 이전 상태를 유지하기 위해 결과에 포함하지 않음
-            continue
-
-        imax_opened, movie_title = parse_imax_status(html)
-        results[date] = {
-            "imax_opened": imax_opened,
-            "movie_title": movie_title,
-        }
-
-        logger.info(
-            "[%s] IMAX=%s, 영화=%s",
-            date,
-            "오픈" if imax_opened else "미오픈",
-            movie_title or "-",
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900},
         )
+        page = context.new_page()
 
-        # 다음 요청 전 랜덤 딜레이 (마지막 요청은 제외)
-        if i < len(target_dates) - 1:
-            delay = random.uniform(*REQUEST_DELAY_RANGE)
-            time.sleep(delay)
+        try:
+            # ── Step 1: CGV 접속 ──
+            logger.info("Playwright: CGV 접속 중...")
+            page.goto("https://www.cgv.co.kr/", wait_until="networkidle", timeout=PW_TIMEOUT)
+            page.wait_for_timeout(1000)
+            _close_popup(page)
+            logger.info("Playwright: CGV 메인 로드 완료")
 
-    # 전체 크롤링 실패 시 경고 (HTML 구조 변경 의심)
-    if target_dates and fetch_failures == len(target_dates):
-        logger.error("모든 날짜의 크롤링이 실패했습니다. CGV 서버 상태를 확인하세요.")
-    elif target_dates and len(results) > 0 and all(
-        not r["imax_opened"] for r in results.values()
-    ):
-        # 정상 크롤링되었으나 모두 미오픈인 것은 정상 케이스
-        logger.info("크롤링 완료: 모든 날짜 IMAX 미오픈 상태")
+            # ── Step 2: 예매 페이지 진입 ──
+            booking_btn = page.locator("button:has-text('예매·예약')").first
+            if not booking_btn.is_visible(timeout=5000):
+                health_issues.append("'예매·예약' 버튼을 찾을 수 없습니다")
+                raise RuntimeError("예매 버튼 미발견")
 
-    return results
+            booking_btn.click()
+            page.wait_for_timeout(PW_NAV_WAIT)
+            logger.info("Playwright: 예매 페이지 진입 → %s", page.url)
+
+            if "/cnm/movieBook" not in page.url:
+                health_issues.append(f"예매 페이지 URL 불일치: {page.url}")
+
+            # ── Step 3: 극장 선택 ──
+            theater_selector = page.locator("button:has-text('극장을 선택')")
+            if theater_selector.count() == 0:
+                health_issues.append("극장 선택 버튼을 찾을 수 없습니다")
+                raise RuntimeError("극장 선택 버튼 미발견")
+
+            theater_selector.first.click()
+            page.wait_for_timeout(PW_CLICK_WAIT)
+
+            # 지역 선택
+            area_btn = page.locator(f"button:has-text('{area}')").first
+            area_btn.click()
+            page.wait_for_timeout(1000)
+
+            # 극장 선택
+            theater_btn = page.locator(f"button:has-text('{theater_name}')")
+            if theater_btn.count() == 0:
+                # fallback: 정확한 텍스트 매칭
+                theater_btn = page.locator(f"text={theater_name}")
+
+            if theater_btn.count() == 0:
+                health_issues.append(f"극장 '{theater_name}'을 찾을 수 없습니다")
+                raise RuntimeError(f"극장 미발견: {theater_name}")
+
+            theater_btn.first.click()
+            page.wait_for_timeout(PW_SCHEDULE_WAIT)
+            logger.info("Playwright: 극장 '%s' 선택 완료", theater_name)
+
+            # ── Health Check: 날짜 스크롤바 존재 확인 ──
+            day_buttons = page.locator("[class*='dayScroll_scrollItem']")
+            if day_buttons.count() == 0:
+                health_issues.append("날짜 선택 스크롤바가 렌더링되지 않았습니다")
+
+            # ── Health Check: 영화 목록 존재 확인 ──
+            screen_info = page.locator("[class*='screenInfo_title']")
+            if screen_info.count() == 0:
+                health_issues.append("상영 정보(screenInfo)가 렌더링되지 않았습니다")
+
+            # ── Step 4: 각 날짜별 IMAX 확인 ──
+            for i, date_str in enumerate(target_dates):
+                if len(date_str) != 8 or not date_str.isdigit():
+                    logger.warning("잘못된 날짜 형식 스킵: %s", date_str)
+                    continue
+
+                try:
+                    if not _click_date_button(page, date_str):
+                        health_issues.append(f"[{date_str}] 날짜 버튼 클릭 실패")
+                        continue
+
+                    page.wait_for_timeout(PW_SCHEDULE_WAIT)
+
+                    imax_opened, movie_title = _parse_schedule(page)
+                    results[date_str] = {
+                        "imax_opened": imax_opened,
+                        "movie_title": movie_title,
+                    }
+
+                    logger.info(
+                        "[%s] IMAX=%s, 영화=%s",
+                        date_str,
+                        "오픈" if imax_opened else "미오픈",
+                        movie_title or "-",
+                    )
+
+                except PwTimeout:
+                    logger.error("[%s] 타임아웃 발생", date_str)
+                    health_issues.append(f"[{date_str}] Playwright 타임아웃")
+                except Exception as e:
+                    logger.error("[%s] 파싱 오류: %s", date_str, e)
+                    health_issues.append(f"[{date_str}] 파싱 오류: {e}")
+
+                # Anti-ban 딜레이
+                if i < len(target_dates) - 1:
+                    delay = random.uniform(*REQUEST_DELAY_RANGE)
+                    time.sleep(delay)
+
+        except RuntimeError as e:
+            logger.error("크롤링 중단: %s", e)
+        except PwTimeout as e:
+            logger.error("Playwright 전역 타임아웃: %s", e)
+            health_issues.append(f"Playwright 전역 타임아웃: {e}")
+        except Exception as e:
+            logger.error("예기치 않은 오류: %s", e)
+            health_issues.append(f"예기치 않은 오류: {e}")
+        finally:
+            browser.close()
+            logger.info("Playwright: 브라우저 종료")
+
+    return results, health_issues
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: State Management (TODO)
+# Phase 2: State Management
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +442,7 @@ def prune_past_dates(status: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Telegram Notification (TODO)
+# Phase 3: Telegram Notification
 # ---------------------------------------------------------------------------
 
 
@@ -336,11 +455,11 @@ def send_telegram_message(text: str) -> bool:
     """텔레그램 API를 호출하여 메시지를 발송한다."""
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
+
     if not bot_token or not chat_id:
         logger.error("텔레그램 환경변수(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)가 설정되지 않았습니다.")
         return False
-        
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -348,7 +467,7 @@ def send_telegram_message(text: str) -> bool:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    
+
     for attempt in range(1, 3):  # 최대 2회 재시도
         try:
             response = requests.post(url, json=payload, timeout=10)
@@ -358,7 +477,7 @@ def send_telegram_message(text: str) -> bool:
             logger.warning("텔레그램 메시지 발송 실패 (attempt %d/2): %s", attempt, e)
             if attempt < 2:
                 time.sleep(2)
-                
+
     logger.error("텔레그램 메시지 발송을 최종 실패했습니다.")
     return False
 
@@ -367,24 +486,24 @@ def send_telegram_alert(movie_title: str, target_date: str) -> bool:
     """예매 오픈 알림을 텔레그램으로 발송한다."""
     formatted_date = f"{target_date[:4]}.{target_date[4:6]}.{target_date[6:]}"
     detected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    
+
     text = (
         f"🔔 *용아맥 예매 오픈!* 🔔\n\n"
         f"🎬 영화: {movie_title}\n"
         f"📅 상영일: {formatted_date}\n"
         f"🕐 감지 시각: {detected_at}\n\n"
         f"👉 지금 바로 예매하세요!\n"
-        f"https://m.cgv.co.kr/WebApp/MovieV4/movieDetail.aspx?theaterCd=0013&date={target_date}"
+        f"https://www.cgv.co.kr/cnm/movieBook"
     )
-    
+
     logger.info("텔레그램 알림 발송 시도: %s (%s)", movie_title, target_date)
     return send_telegram_message(text)
 
 
 def send_telegram_warning(message: str) -> bool:
     """시스템 경고 알림을 텔레그램으로 발송한다."""
-    text = f"⚠️ *Yong-IMAX Watcher 시스템 경고* ⚠️\n\n{message}"
-    logger.info("텔레그램 경고 발송 시도: %s", message)
+    text = f"⚠️ *Yong-IMAX Watcher 경고* ⚠️\n\n{message}"
+    logger.info("텔레그램 경고 발송 시도")
     return send_telegram_message(text)
 
 
@@ -395,7 +514,7 @@ def send_telegram_warning(message: str) -> bool:
 
 def main():
     logger.info("=" * 50)
-    logger.info("Yong-IMAX Watcher 실행 시작")
+    logger.info("Yong-IMAX Watcher v2.0 실행 시작 (Playwright)")
     logger.info("=" * 50)
 
     # 1. 설정 로드
@@ -416,19 +535,30 @@ def main():
     # 2. 이전 상태 로드
     old_status = load_status()
 
-    # 3. 크롤링 실행
-    current_results = crawl_target_dates(config)
+    # 3. Playwright 크롤링 실행
+    current_results, health_issues = crawl_target_dates(config)
+
+    # 4. 건강 체크 경고 발송
+    if health_issues:
+        warning_msg = "크롤링 중 이상이 감지되었습니다:\n\n"
+        for issue in health_issues:
+            warning_msg += f"• {issue}\n"
+            logger.warning("Health Check: %s", issue)
+        warning_msg += "\nCGV 사이트 구조 변경 등을 확인하세요."
+
+        if not is_dry_run():
+            send_telegram_warning(warning_msg)
+        else:
+            logger.info("[DRY_RUN] 경고 알림 발송 생략")
 
     if not current_results:
         logger.warning("크롤링 결과가 없습니다. 이전 상태를 유지합니다.")
-        if not is_dry_run():
-            send_telegram_warning("전체 날짜 크롤링에 실패했습니다. 사이트 구조 변경 등을 확인하세요.")
         return
 
-    # 4. 상태 비교 및 알림 대상 추출
+    # 5. 상태 비교 및 알림 대상 추출
     alerts = compare_and_detect(old_status, current_results)
 
-    # 5. 알림 발송
+    # 6. 알림 발송
     if is_dry_run():
         logger.info("[DRY_RUN] 알림 대상 %d건 (발송 생략)", len(alerts))
         for alert in alerts:
@@ -437,7 +567,7 @@ def main():
         for alert in alerts:
             send_telegram_alert(alert["movie_title"], alert["date"])
 
-    # 6. 상태 업데이트 및 저장
+    # 7. 상태 업데이트 및 저장
     now = datetime.now(KST).isoformat()
 
     new_status = load_status()  # 최신 파일 기반으로 갱신
@@ -457,16 +587,17 @@ def main():
 
     save_status(new_status)
 
-    # 7. 요약 로그
+    # 8. 요약 로그
     opened_count = sum(
         1 for d in new_status["dates"].values() if d.get("imax_opened")
     )
     logger.info("-" * 50)
     logger.info(
-        "실행 완료 | 크롤링: %d건 | 오픈: %d건 | 신규 알림: %d건",
+        "실행 완료 | 크롤링: %d건 | 오픈: %d건 | 신규 알림: %d건 | 경고: %d건",
         len(current_results),
         opened_count,
         len(alerts),
+        len(health_issues),
     )
     logger.info("=" * 50)
 

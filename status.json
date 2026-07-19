@@ -1,10 +1,10 @@
 {
-  "last_checked": "2026-07-19T22:00:11.305052+09:00",
+  "last_checked": "2026-07-19T22:45:30.302596+09:00",
   "dates": {
     "20260731": {
-      "imax_opened": false,
-      "movie_title": "",
-      "first_detected_at": null
+      "imax_opened": true,
+      "movie_title": "스파이더맨-브랜드 뉴 데이",
+      "first_detected_at": "2026-07-19T22:35:22.742301+09:00"
     }
   }
 }
