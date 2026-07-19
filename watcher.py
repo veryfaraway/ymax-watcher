@@ -86,6 +86,9 @@ def load_config() -> dict:
     if "target_dates" not in config or not isinstance(config["target_dates"], list):
         logger.error("config.json에 'target_dates' 리스트가 없습니다.")
         sys.exit(1)
+        
+    if "hall_types" not in config:
+        config["hall_types"] = ["IMAX"]  # 호환성을 위한 기본값
 
     return config
 
@@ -165,32 +168,39 @@ def _click_date_button(page, target_date: str) -> bool:
     return False
 
 
-def _parse_schedule(page) -> tuple[bool, str]:
+def _parse_schedule(page, hall_types: list[str]) -> list[dict]:
     """
-    현재 렌더링된 예매 페이지에서 IMAX 상영 여부를 파싱한다.
-    DOM을 순회하며 영화 제목(title2 등)과 상영 타입(IMAX)의 연관성을 찾는다.
+    현재 렌더링된 예매 페이지에서 지정된 특수관 상영 여부를 파싱한다.
+    DOM을 순회하며 영화 제목(title2 등)과 상영 타입의 연관성을 찾는다.
 
     Returns:
-        (imax_found, movie_title) 튜플
+        [{"type": "SCREENX", "title": "영화이름"}, ...]
     """
     try:
         # 브라우저 컨텍스트 내에서 실행되는 DOM 분석 스크립트
-        imax_movies = page.evaluate('''() => {
+        opened_movies = page.evaluate('''([types]) => {
             const results = [];
             
-            // 전략 1: 영화 카드로 추정되는 블록(li, item, movie)에서 IMAX 뱃지/텍스트와 제목을 함께 추출
+            // 전략 1: 영화 카드로 추정되는 블록(li, item, movie)에서 특수관 뱃지/텍스트와 제목을 함께 추출
             const movieCards = document.querySelectorAll('li, [class*="item"], [class*="movie"], [class*="card"], [class*="sect-showtimes"]');
             
             for (const card of movieCards) {
                 const titleEl = card.querySelector('[class*="title2"], [class*="movNm"], [class*="movie-name"], strong');
                 const title = titleEl ? titleEl.textContent.trim() : "";
                 
-                const hasImaxImg = card.querySelector('img[alt*="IMAX"]') !== null;
-                const hasImaxText = card.textContent.toUpperCase().includes('IMAX');
+                let foundType = null;
+                for (const t of types) {
+                    const hasImg = card.querySelector(`img[alt*="${t}"]`) !== null;
+                    const hasText = card.textContent.toUpperCase().includes(t.toUpperCase());
+                    if (hasImg || hasText) {
+                        foundType = t;
+                        break;
+                    }
+                }
                 
-                if (title && title.length > 1 && (hasImaxImg || hasImaxText)) {
-                    if (!results.includes(title)) {
-                        results.push(title);
+                if (title && title.length > 1 && foundType) {
+                    if (!results.some(r => r.title === title && r.type === foundType)) {
+                        results.push({title: title, type: foundType});
                     }
                 }
             }
@@ -200,16 +210,18 @@ def _parse_schedule(page) -> tuple[bool, str]:
                 const allTitles = document.querySelectorAll('[class*="screenInfo_title"]');
                 for (let i = 0; i < allTitles.length; i++) {
                     const text = allTitles[i].textContent.trim();
-                    if (text.toUpperCase().includes('IMAX')) {
-                        // IMAX 텍스트를 찾았으면 앞선 요소들 중 진짜 영화 제목을 찾음 (상영 타입 제외)
+                    let matchedType = types.find(t => text.toUpperCase().includes(t.toUpperCase()));
+                    
+                    if (matchedType) {
+                        // 특수관 텍스트를 찾았으면 앞선 요소들 중 진짜 영화 제목을 찾음 (상영 타입 제외)
                         for (let j = i - 1; j >= 0; j--) {
                             const prevText = allTitles[j].textContent.trim();
                             const isScreenType = prevText.includes('2D') || prevText.includes('4DX') || 
-                                                 prevText.includes('SCREENX') || prevText.includes('관');
+                                                 prevText.includes('SCREENX') || prevText.includes('관') || prevText.includes('IMAX');
                             
                             if (prevText && !isScreenType && prevText.length > 1) {
-                                if (!results.includes(prevText)) {
-                                    results.push(prevText);
+                                if (!results.some(r => r.title === prevText && r.type === matchedType)) {
+                                    results.push({title: prevText, type: matchedType});
                                 }
                                 break;
                             }
@@ -219,23 +231,16 @@ def _parse_schedule(page) -> tuple[bool, str]:
             }
             
             return results;
-        }''')
+        }''', [hall_types])
         
-        if imax_movies:
-            # 여러 개일 경우 콤마로 연결해서 확인, 반환은 첫번째 영화
-            logger.info("IMAX 감지: %s", ", ".join(imax_movies))
-            return True, imax_movies[0]
-            
-        # 최후의 수단: 단순히 화면 전체에 IMAX가 있는지 검사
-        content = page.content()
-        if "IMAX" in content:
-            logger.info("IMAX 텍스트는 감지되었으나 영화 제목을 매칭하지 못함")
-            return True, "제목 미상 (IMAX 발견)"
+        if opened_movies:
+            logger.info("특수관 감지: %s", ", ".join(f"{m['type']}({m['title']})" for m in opened_movies))
+            return opened_movies
             
     except Exception as e:
-        logger.error("IMAX 파싱 스크립트 실행 중 오류: %s", e)
+        logger.error("상영시간표 파싱 스크립트 실행 중 오류: %s", e)
         
-    return False, ""
+    return []
 
 
 def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
@@ -338,18 +343,16 @@ def crawl_target_dates(config: dict) -> tuple[dict, list[str]]:
 
                     page.wait_for_timeout(PW_SCHEDULE_WAIT)
 
-                    imax_opened, movie_title = _parse_schedule(page)
+                    opened_movies = _parse_schedule(page, config["hall_types"])
                     results[date_str] = {
-                        "imax_opened": imax_opened,
-                        "movie_title": movie_title,
+                        "opened_movies": opened_movies
                     }
 
-                    logger.info(
-                        "[%s] IMAX=%s, 영화=%s",
-                        date_str,
-                        "오픈" if imax_opened else "미오픈",
-                        movie_title or "-",
-                    )
+                    if opened_movies:
+                        for m in opened_movies:
+                            logger.info("[%s] %s 오픈: %s", date_str, m['type'], m['title'])
+                    else:
+                        logger.info("[%s] %s 미오픈", date_str, "/".join(config["hall_types"]))
 
                 except PwTimeout:
                     logger.error("[%s] 타임아웃 발생", date_str)
@@ -412,18 +415,29 @@ def compare_and_detect(old_status: dict, current_results: dict) -> list[dict]:
     old_dates = old_status.get("dates", {})
 
     for date, result in current_results.items():
-        if not result["imax_opened"]:
-            continue
-
+        opened_movies = result.get("opened_movies", [])
         old_entry = old_dates.get(date, {})
-        was_opened = old_entry.get("imax_opened", False)
-
-        if not was_opened:
-            alerts.append({
-                "date": date,
-                "movie_title": result["movie_title"],
-            })
-            logger.info("🔔 신규 오픈 감지: %s — %s", date, result["movie_title"])
+        old_opened_movies = old_entry.get("opened_movies", [])
+        
+        # 이전엔 안 열렸는데 새로 열린 특수관/영화 조합 찾기
+        for current in opened_movies:
+            is_new = True
+            for old in old_opened_movies:
+                if old.get("title") == current["title"] and old.get("type") == current["type"]:
+                    is_new = False
+                    break
+            
+            # (호환성) 이전에 imax_opened가 true였고 현재 타입이 IMAX라면 새로 알림 안 줌
+            if current["type"] == "IMAX" and old_entry.get("imax_opened") is True and old_entry.get("movie_title") == current["title"]:
+                is_new = False
+                    
+            if is_new:
+                alerts.append({
+                    "date": date,
+                    "movie_title": current["title"],
+                    "hall_type": current["type"]
+                })
+                logger.info("🔔 신규 %s 오픈 감지: %s — %s", current["type"], date, current["title"])
 
     return alerts
 
@@ -482,13 +496,13 @@ def send_telegram_message(text: str) -> bool:
     return False
 
 
-def send_telegram_alert(movie_title: str, target_date: str) -> bool:
+def send_telegram_alert(movie_title: str, target_date: str, hall_type: str) -> bool:
     """예매 오픈 알림을 텔레그램으로 발송한다."""
     formatted_date = f"{target_date[:4]}.{target_date[4:6]}.{target_date[6:]}"
     detected_at = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
     text = (
-        f"🔔 *용아맥 예매 오픈!* 🔔\n\n"
+        f"🔔 *CGV {hall_type} 예매 오픈!* 🔔\n\n"
         f"🎬 영화: {movie_title}\n"
         f"📅 상영일: {formatted_date}\n"
         f"🕐 감지 시각: {detected_at}\n\n"
@@ -496,7 +510,7 @@ def send_telegram_alert(movie_title: str, target_date: str) -> bool:
         f"https://www.cgv.co.kr/cnm/movieBook"
     )
 
-    logger.info("텔레그램 알림 발송 시도: %s (%s)", movie_title, target_date)
+    logger.info("텔레그램 알림 발송 시도: [%s] %s (%s)", hall_type, movie_title, target_date)
     return send_telegram_message(text)
 
 
@@ -562,10 +576,10 @@ def main():
     if is_dry_run():
         logger.info("[DRY_RUN] 알림 대상 %d건 (발송 생략)", len(alerts))
         for alert in alerts:
-            logger.info("[DRY_RUN] → %s: %s", alert["date"], alert["movie_title"])
+            logger.info("[DRY_RUN] → %s: [%s] %s", alert["date"], alert["hall_type"], alert["movie_title"])
     else:
         for alert in alerts:
-            send_telegram_alert(alert["movie_title"], alert["date"])
+            send_telegram_alert(alert["movie_title"], alert["date"], alert["hall_type"])
 
     # 7. 상태 업데이트 및 저장
     now = datetime.now(KST).isoformat()
@@ -574,12 +588,8 @@ def main():
     new_status["last_checked"] = now
 
     for date, result in current_results.items():
-        existing = new_status["dates"].get(date, {})
         new_status["dates"][date] = {
-            "imax_opened": result["imax_opened"],
-            "movie_title": result["movie_title"],
-            "first_detected_at": existing.get("first_detected_at")
-            or (now if result["imax_opened"] else None),
+            "opened_movies": result["opened_movies"]
         }
 
     # 과거 날짜 정리
@@ -589,7 +599,7 @@ def main():
 
     # 8. 요약 로그
     opened_count = sum(
-        1 for d in new_status["dates"].values() if d.get("imax_opened")
+        len(d.get("opened_movies", [])) for d in new_status["dates"].values()
     )
     logger.info("-" * 50)
     logger.info(
