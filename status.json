@@ -1,5 +1,5 @@
 {
-  "last_checked": "2026-07-21T00:05:37.559843+09:00",
+  "last_checked": "2026-07-21T08:52:33.487014+09:00",
   "dates": {
     "20260731": {
       "opened_movies": [
@@ -10,10 +10,20 @@
       ]
     },
     "20260729": {
-      "opened_movies": []
+      "opened_movies": [
+        {
+          "title": "경멸",
+          "type": "SCREENX"
+        }
+      ]
     },
     "20260805": {
-      "opened_movies": []
+      "opened_movies": [
+        {
+          "title": "경멸",
+          "type": "IMAX"
+        }
+      ]
     }
   }
 }
