@@ -125,11 +125,18 @@ def _click_date_button(page, target_date: str) -> bool:
       - 같은 달: "오늘19", "월20", ..., "금31"
       - 다음 달: "토8.1", "일02"
 
+    Note:
+      CGV는 Swiper 슬라이더를 사용하며, 각 날짜 버튼이 중복 렌더링됨.
+      또한 swiper-button-next/prev 오버레이가 버튼 위를 가려
+      일반 click()이 차단될 수 있으므로 JS dispatchEvent로 클릭한다.
+
     Args:
         target_date: YYYYMMDD 형식
     Returns:
         클릭 성공 여부
     """
+    import re
+
     target_day = int(target_date[6:8])
     target_month = int(target_date[4:6])
     today = datetime.now(KST)
@@ -147,27 +154,26 @@ def _click_date_button(page, target_date: str) -> bool:
         btn = day_buttons.nth(i)
         text = btn.text_content().strip()
 
-        # 같은 달: "금31" → 끝의 숫자가 target_day와 일치
-        # 다음 달: "8.1" → "M.D" 형식에서 M=target_month, D=target_day
+        matched = False
         if is_same_month:
-            # 텍스트에서 숫자 추출 (마지막 숫자들)
-            import re
+            # 같은 달: "금31" → 끝의 숫자가 target_day와 일치
             match = re.search(r'(\d+)$', text)
             if match and int(match.group(1)) == target_day:
-                btn.scroll_into_view_if_needed()
-                btn.click()
-                logger.info("[%s] 날짜 선택: '%s'", target_date, text)
-                return True
+                matched = True
         else:
-            # "8.1" 형식
+            # 다음 달: "8.1" 또는 "02" 형식
             target_str = f"{target_month}.{target_day}"
-            # 또는 "02" (2자리 일)
             target_str2 = f"{target_day:02d}"
-            if target_str in text or (not is_same_month and text.endswith(target_str2)):
-                btn.scroll_into_view_if_needed()
-                btn.click()
-                logger.info("[%s] 날짜 선택: '%s'", target_date, text)
-                return True
+            if target_str in text or text.endswith(target_str2):
+                matched = True
+
+        if matched:
+            btn.scroll_into_view_if_needed()
+            # Swiper 오버레이(swiper-button-next/prev)가 버튼을 가릴 수 있으므로
+            # JS 이벤트를 직접 발생시켜 오버레이를 우회한다
+            btn.dispatch_event("click")
+            logger.info("[%s] 날짜 선택: '%s'", target_date, text)
+            return True
 
     logger.warning("[%s] 날짜 버튼을 찾지 못함 (버튼 %d개 검색)", target_date, count)
     return False
