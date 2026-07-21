@@ -170,8 +170,10 @@ def _click_date_button(page, target_date: str) -> bool:
         if matched:
             btn.scroll_into_view_if_needed()
             # Swiper 오버레이(swiper-button-next/prev)가 버튼을 가릴 수 있으므로
-            # JS 이벤트를 직접 발생시켜 오버레이를 우회한다
-            btn.dispatch_event("click")
+            # 일반 click()은 차단된다.
+            # dispatch_event('click')은 React 이벤트 리스너를 트리거하지 못할 수 있으므로
+            # Playwright의 force=True 속성을 사용하여 강제 클릭한다.
+            btn.click(force=True)
             logger.info("[%s] 날짜 선택: '%s'", target_date, text)
             return True
 
