@@ -192,31 +192,42 @@ def _parse_schedule(page, hall_types: list[str]) -> list[dict]:
         opened_movies = page.evaluate('''([types]) => {
             const results = [];
             
-            // 전략 1: 영화 카드로 추정되는 블록(li, item, movie)에서 특수관 뱃지/텍스트와 제목을 함께 추출
-            const movieCards = document.querySelectorAll('li, [class*="item"], [class*="movie"], [class*="card"], [class*="sect-showtimes"]');
-            
-            for (const card of movieCards) {
-                const titleEl = card.querySelector('[class*="title2"], [class*="movNm"], [class*="movie-name"], strong');
-                const title = titleEl ? titleEl.textContent.trim() : "";
+            // 1. 특수관 배지 이미지 기반 탐색 (정확도 높음)
+            const badges = document.querySelectorAll('img');
+            for (const badge of badges) {
+                const altText = (badge.alt || '').toUpperCase();
                 
                 let foundType = null;
                 for (const t of types) {
-                    const hasImg = card.querySelector(`img[alt*="${t}"]`) !== null;
-                    const hasText = card.textContent.toUpperCase().includes(t.toUpperCase());
-                    if (hasImg || hasText) {
+                    if (altText.includes(t.toUpperCase())) {
                         foundType = t;
                         break;
                     }
                 }
                 
-                if (title && title.length > 1 && foundType) {
-                    if (!results.some(r => r.title === title && r.type === foundType)) {
-                        results.push({title: title, type: foundType});
+                if (foundType) {
+                    let el = badge;
+                    let movieTitle = null;
+                    // 부모로 거슬러 올라가며 가장 가까운 영화 제목(형제/자식 요소)을 찾음
+                    for (let depth = 0; depth < 10; depth++) {
+                        el = el.parentElement;
+                        if (!el) break;
+                        const titleEl = el.querySelector('[class*="title2"], [class*="movNm"], [class*="movie-name"], [class*="movieName"]');
+                        if (titleEl) {
+                            movieTitle = titleEl.textContent.trim();
+                            break;
+                        }
+                    }
+                    
+                    if (movieTitle && movieTitle.length > 1) {
+                        if (!results.some(r => r.title === movieTitle && r.type === foundType)) {
+                            results.push({title: movieTitle, type: foundType});
+                        }
                     }
                 }
             }
             
-            // 전략 2: 형제/이웃 요소 기반 탐색 (클래스 구조가 평탄화된 경우)
+            // 2. 텍스트 기반 탐색 (클래스 구조가 평탄화된 경우 Fallback)
             if (results.length === 0) {
                 const allTitles = document.querySelectorAll('[class*="screenInfo_title"]');
                 for (let i = 0; i < allTitles.length; i++) {
